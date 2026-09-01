@@ -83,6 +83,12 @@ def parse_store_file(data: bytes, filename: str):
     for c in out.columns:
         out[c] = out[c].map(clean_scalar)
 
+    # DPW hold records are old/non-orderable Ship-To locations and should not
+    # be offered to users. Credit statuses beginning H include e.g.
+    # "H - Hold All - No Order Entry".
+    if "Credit Status" in out.columns:
+        out = out[~out["Credit Status"].str.upper().str.startswith("H", na=False)]
+
     out = out[out["Ship-To Number"] != ""].drop_duplicates(subset=["Ship-To Number"], keep="first")
     out["_address"] = out.apply(format_store_address, axis=1)
     out["_search"] = out.apply(
@@ -227,6 +233,12 @@ def load_reference_data(storage):
         if df is not None:
             for col in df.columns:
                 df[col] = df[col].fillna("").map(clean_scalar)
+
+    # Also filter the already-saved lookup so this rule takes effect immediately
+    # without requiring the admin to upload the stores file again.
+    if stores is not None and "Credit Status" in stores.columns:
+        stores = stores[~stores["Credit Status"].str.upper().str.startswith("H", na=False)].reset_index(drop=True)
+
     return releases, stores
 
 
@@ -296,7 +308,7 @@ def render_admin(storage) -> None:
     if store_file is not None:
         try:
             stores_df = parse_store_file(store_file.getvalue(), store_file.name)
-            st.success(f"Valid store list — {len(stores_df):,} Ship-To locations.")
+            st.success(f"Valid store list — {len(stores_df):,} active Ship-To locations.")
             st.dataframe(
                 stores_df[["Ship-To Number", "Ship-To Name", "_address"]].head(10),
                 use_container_width=True,
@@ -307,7 +319,7 @@ def render_admin(storage) -> None:
                 storage.save_bytes(f"latest_stores{Path(store_file.name).suffix.lower()}", store_file.getvalue())
                 storage.save_text("stores_updated.txt", pd.Timestamp.utcnow().isoformat())
                 st.session_state.pop("_reference_data", None)
-                st.success(f"Store lookup updated: {len(stores_df):,} Ship-To locations loaded.")
+                st.success(f"Store lookup updated: {len(stores_df):,} active Ship-To locations loaded.")
                 st.rerun()
         except Exception as exc:
             st.error(str(exc))
@@ -384,9 +396,6 @@ def render_builder(releases, stores) -> None:
                     f'Ship-To **{selected_store["Ship-To Number"]}**  \n'
                     f'{selected_store["_address"]}'
                 )
-                credit = clean_scalar(selected_store.get("Credit Status", ""))
-                if credit and not credit.startswith("A"):
-                    st.warning(f"Customer status: {credit}. You can still use this Ship-To location.")
 
     c1, c2 = st.columns(2)
     with c1:
