@@ -281,6 +281,10 @@ def render_builder(releases: pd.DataFrame, stores: pd.DataFrame) -> None:
     if "shipments" not in st.session_state:
         st.session_state.shipments = []
 
+    if st.session_state.pop("clear_builder_form", False):
+        st.session_state["release_query"] = ""
+        st.session_state["store_query"] = ""
+
     st.subheader("New direct shipment")
 
     release_query = st.text_input(
@@ -360,8 +364,7 @@ def render_builder(releases: pd.DataFrame, stores: pd.DataFrame) -> None:
                 "update_stock": "Y",
             }
         )
-        st.session_state.release_query = ""
-        st.session_state.store_query = ""
+        st.session_state["clear_builder_form"] = True
         st.rerun()
 
     if st.session_state.shipments:
