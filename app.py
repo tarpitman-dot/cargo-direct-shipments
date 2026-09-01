@@ -154,12 +154,36 @@ def parse_stock_zip(data: bytes) -> tuple[pd.DataFrame, str]:
     )
 
 
-def search_rows(df: pd.DataFrame, query: str, limit: int = 50) -> pd.DataFrame:
+def search_rows(df: pd.DataFrame, query: str, limit: int = 25) -> pd.DataFrame:
+    """Fast vectorised search with the most likely matches first."""
     terms = [t.casefold() for t in query.split() if t.strip()]
     if not terms:
         return df.iloc[0:0]
-    mask = df["_search"].map(lambda text: all(term in text for term in terms))
-    return df[mask].head(limit)
+
+    search_text = df["_search"].fillna("").astype(str)
+    mask = pd.Series(True, index=df.index)
+    for term in terms:
+        mask &= search_text.str.contains(term, regex=False, na=False)
+
+    matches = df.loc[mask].copy()
+    if matches.empty:
+        return matches
+
+    needle = query.strip().casefold()
+    if "Article Number" in matches.columns:
+        primary = matches["Article Number"].fillna("").astype(str).str.casefold()
+    elif "Ship-To Number" in matches.columns:
+        ship_to = matches["Ship-To Number"].fillna("").astype(str).str.casefold()
+        name = matches["Ship-To Name"].fillna("").astype(str).str.casefold()
+        primary = ship_to.where(ship_to.str.startswith(needle), name)
+    else:
+        primary = matches["_search"].fillna("").astype(str)
+
+    matches["_rank"] = 2
+    matches.loc[primary.str.startswith(needle, na=False), "_rank"] = 1
+    matches.loc[primary.eq(needle), "_rank"] = 0
+    matches = matches.sort_values("_rank", kind="stable").drop(columns=["_rank"])
+    return matches.head(limit)
 
 
 def status_short(text: str) -> str:
@@ -191,6 +215,13 @@ def load_reference_data(storage: ReferenceStorage) -> tuple[pd.DataFrame | None,
             for col in df.columns:
                 df[col] = df[col].fillna("").map(clean_scalar)
     return releases, stores
+
+
+def get_reference_data(storage: ReferenceStorage) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
+    """Keep reference files in memory during the user's session instead of rereading them on every keystroke."""
+    if "_reference_data" not in st.session_state:
+        st.session_state["_reference_data"] = load_reference_data(storage)
+    return st.session_state["_reference_data"]
 
 
 def _secret(name: str) -> str:
@@ -243,6 +274,7 @@ def render_admin(storage: ReferenceStorage) -> None:
                 storage.save_dataframe("stock_lookup.csv", stock_df)
                 storage.save_bytes("latest_stock.zip", stock_zip.getvalue(), content_type="application/zip")
                 storage.save_text("stock_updated.txt", pd.Timestamp.utcnow().isoformat())
+                st.session_state.pop("_reference_data", None)
                 st.success(f"Stock lookup updated: {len(stock_df):,} catalogue items loaded.")
                 st.rerun()
         except Exception as exc:
@@ -263,6 +295,7 @@ def render_admin(storage: ReferenceStorage) -> None:
                 storage.save_dataframe("stores_lookup.csv", stores_df)
                 storage.save_bytes(f"latest_stores{Path(store_file.name).suffix.lower()}", store_file.getvalue())
                 storage.save_text("stores_updated.txt", pd.Timestamp.utcnow().isoformat())
+                st.session_state.pop("_reference_data", None)
                 st.success(f"Store lookup updated: {len(stores_df):,} Ship-To locations loaded.")
                 st.rerun()
         except Exception as exc:
@@ -348,7 +381,7 @@ def render_builder(releases: pd.DataFrame, stores: pd.DataFrame) -> None:
     with c1:
         qty = st.number_input("Quantity shipped", min_value=1, step=1, value=1)
     with c2:
-        shipped_date = st.date_input("Date shipped", value=date.today())
+        shipped_date = st.date_input("Date shipped", value=date.today(), format="YYYY-MM-DD")
 
     ready = selected_release is not None and selected_store is not None and int(qty) > 0
     if st.button("Add shipment", type="primary", disabled=not ready, use_container_width=True):
@@ -360,7 +393,7 @@ def render_builder(releases: pd.DataFrame, stores: pd.DataFrame) -> None:
                 "account_number": selected_store["Ship-To Number"],
                 "ship_to": selected_store["Ship-To Name"],
                 "address": selected_store["_address"],
-                "date_shipped": shipped_date.isoformat(),
+                "date_shipped": shipped_date.strftime("%Y-%m-%d"),
                 "update_stock": "Y",
             }
         )
@@ -389,7 +422,6 @@ def render_builder(releases: pd.DataFrame, stores: pd.DataFrame) -> None:
         with e1:
             if st.button("Apply changes / remove checked", use_container_width=True):
                 edited = edited[~edited["remove"].fillna(False)].drop(columns=["remove"])
-                # Validate editable values before committing.
                 try:
                     edited["quantity"] = pd.to_numeric(edited["quantity"], errors="raise").astype(int)
                     if (edited["quantity"] <= 0).any():
@@ -408,7 +440,10 @@ def render_builder(releases: pd.DataFrame, stores: pd.DataFrame) -> None:
 
         export_df = pd.DataFrame(st.session_state.shipments)[
             ["catalogue_number", "quantity", "account_number", "date_shipped", "update_stock"]
-        ]
+        ].copy()
+        export_df["date_shipped"] = pd.to_datetime(
+            export_df["date_shipped"], format="%Y-%m-%d", errors="raise"
+        ).dt.strftime("%Y-%m-%d")
         csv_bytes = export_df.to_csv(index=False, lineterminator="\n").encode("utf-8")
         st.download_button(
             "Download DPW CSV",
@@ -425,7 +460,7 @@ def main() -> None:
     require_login()
 
     storage = ReferenceStorage(DATA_DIR)
-    releases, stores = load_reference_data(storage)
+    releases, stores = get_reference_data(storage)
 
     with st.sidebar:
         st.title(APP_TITLE)
