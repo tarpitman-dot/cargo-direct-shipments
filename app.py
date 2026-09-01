@@ -8,10 +8,11 @@ from datetime import date
 from pathlib import Path
 from typing import Iterable
 
-import pandas as pd
 import streamlit as st
 
-from storage_backend import ReferenceStorage
+# Deliberately import pandas and the storage module only after login. This keeps
+# the first screen as light as possible when Streamlit wakes the app.
+pd = None
 
 APP_TITLE = "Direct Shipments"
 DATA_DIR = Path("data")
@@ -37,7 +38,7 @@ def clean_scalar(value: object) -> str:
     return re.sub(r"\s+", " ", text)
 
 
-def _header_index(raw: pd.DataFrame, required: Iterable[str]) -> int:
+def _header_index(raw, required: Iterable[str]) -> int:
     required_norm = {x.strip().casefold() for x in required}
     for idx, row in raw.iterrows():
         values = {clean_scalar(v).casefold() for v in row.tolist() if clean_scalar(v)}
@@ -46,7 +47,7 @@ def _header_index(raw: pd.DataFrame, required: Iterable[str]) -> int:
     raise ValueError(f"Could not find a header row containing: {', '.join(required)}")
 
 
-def _read_tabular_bytes(data: bytes, filename: str, required_header_names: Iterable[str]) -> pd.DataFrame:
+def _read_tabular_bytes(data: bytes, filename: str, required_header_names: Iterable[str]):
     suffix = Path(filename).suffix.lower()
     if suffix == ".csv":
         last_exc = None
@@ -54,11 +55,11 @@ def _read_tabular_bytes(data: bytes, filename: str, required_header_names: Itera
             try:
                 raw = pd.read_csv(io.BytesIO(data), header=None, dtype=str, encoding=encoding, keep_default_na=False)
                 break
-            except Exception as exc:  # pragma: no cover - fallback path
+            except Exception as exc:
                 last_exc = exc
         else:
             raise ValueError(f"Could not read CSV: {last_exc}")
-    elif suffix in {".xlsx", ".xlsm", ".xls"}:
+    elif suffix in {".xlsx", ".xlsm"}:
         raw = pd.read_excel(io.BytesIO(data), header=None, dtype=str, keep_default_na=False)
     else:
         raise ValueError(f"Unsupported file type: {suffix}")
@@ -71,7 +72,7 @@ def _read_tabular_bytes(data: bytes, filename: str, required_header_names: Itera
     return body.reset_index(drop=True)
 
 
-def parse_store_file(data: bytes, filename: str) -> pd.DataFrame:
+def parse_store_file(data: bytes, filename: str):
     df = _read_tabular_bytes(data, filename, STORE_REQUIRED)
     missing = [c for c in STORE_REQUIRED if c not in df.columns]
     if missing:
@@ -104,7 +105,7 @@ def parse_store_file(data: bytes, filename: str) -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 
-def format_store_address(row: pd.Series) -> str:
+def format_store_address(row) -> str:
     parts = [
         clean_scalar(row.get("Address Line 1", "")),
         clean_scalar(row.get("Address Line 2", "")),
@@ -115,7 +116,7 @@ def format_store_address(row: pd.Series) -> str:
     return ", ".join([p for p in parts if p])
 
 
-def parse_stock_zip(data: bytes) -> tuple[pd.DataFrame, str]:
+def parse_stock_zip(data: bytes):
     try:
         zf = zipfile.ZipFile(io.BytesIO(data))
     except zipfile.BadZipFile as exc:
@@ -123,7 +124,7 @@ def parse_stock_zip(data: bytes) -> tuple[pd.DataFrame, str]:
 
     candidates = [
         name for name in zf.namelist()
-        if not name.endswith("/") and Path(name).suffix.lower() in {".csv", ".xlsx", ".xlsm", ".xls"}
+        if not name.endswith("/") and Path(name).suffix.lower() in {".csv", ".xlsx", ".xlsm"}
     ]
     candidates.sort(key=lambda n: ("stock" not in n.casefold(), n.casefold()))
     errors: list[str] = []
@@ -136,13 +137,12 @@ def parse_stock_zip(data: bytes) -> tuple[pd.DataFrame, str]:
                 for c in out.columns:
                     out[c] = out[c].map(clean_scalar)
                 out = out[out["Article Number"] != ""].drop_duplicates(subset=["Article Number"], keep="first")
-                # Deliberately retain no stock-level columns.
-                out["_search"] = out.apply(
-                    lambda r: " ".join(
-                        [r["Article Number"], r["Artist Name"], r["Title"], r["Format"]]
-                    ).casefold(),
-                    axis=1,
-                )
+                out["_search"] = (
+                    out["Article Number"].astype(str)
+                    + " " + out["Artist Name"].astype(str)
+                    + " " + out["Title"].astype(str)
+                    + " " + out["Format"].astype(str)
+                ).str.casefold()
                 return out.reset_index(drop=True), name
         except Exception as exc:
             errors.append(f"{name}: {exc}")
@@ -154,13 +154,13 @@ def parse_stock_zip(data: bytes) -> tuple[pd.DataFrame, str]:
     )
 
 
-def search_rows(df: pd.DataFrame, query: str, limit: int = 25) -> pd.DataFrame:
-    """Fast vectorised search with the most likely matches first."""
+def search_rows(df, query: str, limit: int = 15):
+    """Fast vectorised search with likely matches first."""
     terms = [t.casefold() for t in query.split() if t.strip()]
     if not terms:
         return df.iloc[0:0]
 
-    search_text = df["_search"].fillna("").astype(str)
+    search_text = df["_search"]
     mask = pd.Series(True, index=df.index)
     for term in terms:
         mask &= search_text.str.contains(term, regex=False, na=False)
@@ -171,19 +171,18 @@ def search_rows(df: pd.DataFrame, query: str, limit: int = 25) -> pd.DataFrame:
 
     needle = query.strip().casefold()
     if "Article Number" in matches.columns:
-        primary = matches["Article Number"].fillna("").astype(str).str.casefold()
+        primary = matches["Article Number"].str.casefold()
     elif "Ship-To Number" in matches.columns:
-        ship_to = matches["Ship-To Number"].fillna("").astype(str).str.casefold()
-        name = matches["Ship-To Name"].fillna("").astype(str).str.casefold()
+        ship_to = matches["Ship-To Number"].str.casefold()
+        name = matches["Ship-To Name"].str.casefold()
         primary = ship_to.where(ship_to.str.startswith(needle), name)
     else:
-        primary = matches["_search"].fillna("").astype(str)
+        primary = matches["_search"]
 
     matches["_rank"] = 2
     matches.loc[primary.str.startswith(needle, na=False), "_rank"] = 1
     matches.loc[primary.eq(needle), "_rank"] = 0
-    matches = matches.sort_values("_rank", kind="stable").drop(columns=["_rank"])
-    return matches.head(limit)
+    return matches.sort_values("_rank", kind="stable").drop(columns=["_rank"]).head(limit)
 
 
 def status_short(text: str) -> str:
@@ -195,21 +194,35 @@ def status_short(text: str) -> str:
     return text
 
 
-def release_label(row: pd.Series) -> str:
+def release_label(row) -> str:
     status = status_short(row["Article Status"])
     base = f'{row["Article Number"]} — {row["Artist Name"]} — {row["Title"]} — {row["Format"]}'
     return f"{base} [{status}]" if status else base
 
 
-def store_label(row: pd.Series) -> str:
+def store_label(row) -> str:
     store_no = clean_scalar(row.get("Customer Store Number", ""))
     extra = f" | Store {store_no}" if store_no else ""
     return f'{row["Ship-To Name"]} | Ship-To {row["Ship-To Number"]}{extra} | {row["_address"]}'
 
 
-def load_reference_data(storage: ReferenceStorage) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
-    releases = storage.load_dataframe("stock_lookup.csv")
-    stores = storage.load_dataframe("stores_lookup.csv")
+@st.cache_data(show_spinner=False)
+def _read_lookup_csv(path_text: str, mtime_ns: int):
+    del mtime_ns
+    path = Path(path_text)
+    if not path.exists():
+        return None
+    return pd.read_csv(path, dtype=str, keep_default_na=False)
+
+
+def load_reference_data(storage):
+    frames = []
+    for name in ("stock_lookup.csv", "stores_lookup.csv"):
+        path = storage.local_dir / name
+        mtime = path.stat().st_mtime_ns if path.exists() else -1
+        frames.append(_read_lookup_csv(str(path), mtime))
+
+    releases, stores = frames
     for df in (releases, stores):
         if df is not None:
             for col in df.columns:
@@ -217,8 +230,7 @@ def load_reference_data(storage: ReferenceStorage) -> tuple[pd.DataFrame | None,
     return releases, stores
 
 
-def get_reference_data(storage: ReferenceStorage) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
-    """Keep reference files in memory during the user's session instead of rereading them on every keystroke."""
+def get_reference_data(storage):
     if "_reference_data" not in st.session_state:
         st.session_state["_reference_data"] = load_reference_data(storage)
     return st.session_state["_reference_data"]
@@ -237,7 +249,6 @@ def require_login() -> None:
 
     if "role" not in st.session_state:
         st.session_state.role = None
-
     if st.session_state.role:
         return
 
@@ -259,7 +270,7 @@ def require_login() -> None:
     st.stop()
 
 
-def render_admin(storage: ReferenceStorage) -> None:
+def render_admin(storage) -> None:
     st.subheader("Reference data")
     st.caption("Stock quantities are discarded during import and are never shown in this app.")
 
@@ -281,7 +292,7 @@ def render_admin(storage: ReferenceStorage) -> None:
             st.error(str(exc))
 
     st.divider()
-    store_file = st.file_uploader("Upload/replace store list", type=["csv", "xlsx", "xls"], key="store_file")
+    store_file = st.file_uploader("Upload/replace store list", type=["csv", "xlsx"], key="store_file")
     if store_file is not None:
         try:
             stores_df = parse_store_file(store_file.getvalue(), store_file.name)
@@ -310,7 +321,7 @@ def render_admin(storage: ReferenceStorage) -> None:
         st.caption(f"Store lookup last updated: {stores_updated}")
 
 
-def render_builder(releases: pd.DataFrame, stores: pd.DataFrame) -> None:
+def render_builder(releases, stores) -> None:
     if "shipments" not in st.session_state:
         st.session_state.shipments = []
 
@@ -456,8 +467,16 @@ def render_builder(releases: pd.DataFrame, stores: pd.DataFrame) -> None:
 
 
 def main() -> None:
+    global pd
+
     st.set_page_config(page_title=APP_TITLE, page_icon="📦", layout="wide")
     require_login()
+
+    # Heavy imports happen only after a successful login.
+    if pd is None:
+        import pandas as pandas_module
+        pd = pandas_module
+    from storage_backend import ReferenceStorage
 
     storage = ReferenceStorage(DATA_DIR)
     releases, stores = get_reference_data(storage)
